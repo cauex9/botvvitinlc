@@ -1,0 +1,692 @@
+import telebot
+import requests
+import uuid
+import re
+import json
+import os
+import db
+from dotenv import load_dotenv
+from datetime import datetime
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# ─────────────────────────────────────────────
+# CONFIGURAÇÕES
+# ─────────────────────────────────────────────
+load_dotenv()
+
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+PUBLIC_KEY = os.getenv('POSEIDON_PUBLIC_KEY')
+SECRET_KEY = os.getenv('POSEIDON_SECRET_KEY')
+
+credenciais_faltantes = [
+    nome for nome, valor in {
+        'TELEGRAM_BOT_TOKEN': TOKEN,
+        'POSEIDON_PUBLIC_KEY': PUBLIC_KEY,
+        'POSEIDON_SECRET_KEY': SECRET_KEY,
+    }.items() if not valor
+]
+if credenciais_faltantes:
+    raise RuntimeError(
+        'Configure no arquivo .env: ' + ', '.join(credenciais_faltantes)
+    )
+
+DONO_ID = 8241738977      # <-- ID do dono no Telegram
+DONO_CHAT_ID  = None                    # <-- preenchido automaticamente quando o dono usar /start
+
+POSEIDON_URL = 'https://app.poseidonpay.site/api/v1/gateway/pix/receive'
+
+bot = telebot.TeleBot(TOKEN)
+
+# ─────────────────────────────────────────────
+# ESTADO DE CONVERSA (em memória)
+# ─────────────────────────────────────────────
+user_state = {}
+
+# ─────────────────────────────────────────────
+# SISTEMA DE BANCO DE DADOS (SUPABASE / FALLBACK)
+# ─────────────────────────────────────────────
+def saldo_usuario(user_id: int) -> float:
+    return db.saldo_usuario(user_id)
+
+def carregar_historico() -> list:
+    return db.carregar_historico()
+
+def registrar_evento(user_id: int, nome: str, username: str, acao: str, detalhe: str = ""):
+    db.registrar_evento(user_id, nome, username, acao, detalhe)
+
+def notificar_dono(texto: str):
+    """Envia notificação para o dono do bot."""
+    global DONO_CHAT_ID
+    if DONO_CHAT_ID:
+        try:
+            bot.send_message(DONO_CHAT_ID, texto, parse_mode="Markdown")
+        except Exception:
+            pass
+
+
+
+# ─────────────────────────────────────────────
+# MENUS
+# ─────────────────────────────────────────────
+def menu_principal(username=""):
+    markup = InlineKeyboardMarkup()
+    btn_comprar = InlineKeyboardButton("💳 Comprar CC", callback_data="comprar")
+    btn_conta   = InlineKeyboardButton("👤 Minha conta", callback_data="conta")
+    btn_saldo   = InlineKeyboardButton("💰 Adicionar saldo", callback_data="saldo")
+    btn_dono    = InlineKeyboardButton("👑 Dono", url=f"tg://user?id={DONO_ID}")
+    markup.add(btn_comprar)
+    markup.row(btn_conta, btn_saldo)
+    markup.add(btn_dono)
+
+    return markup
+
+def menu_produtos():
+    markup = InlineKeyboardMarkup()
+    produtos = [
+        ("AMEX | R$ 30",          "prod_AMEX|30"),
+        ("B2B | R$ 20",           "prod_B2B|20"),
+        ("BLACK | R$ 30",         "prod_BLACK|30"),
+        ("BUSINESS | R$ 20",      "prod_BUSINESS|20"),
+        ("CLASSIC | R$ 15",       "prod_CLASSIC|15"),
+        ("CORPORATE | R$ 30",     "prod_CORPORATE|30"),
+        ("ELECTRON | R$ 20",      "prod_ELECTRON|20"),
+        ("ELO | R$ 40",           "prod_ELO|40"),
+        ("GOLD | R$ 15",          "prod_GOLD|15"),
+        ("INDEFINIDO | R$ 20",    "prod_INDEFINIDO|20"),
+        ("INFINITE | R$ 30",      "prod_INFINITE|30"),
+        ("NUBA GOLD | R$ 15",     "prod_NUBAGOLD|15"),
+        ("NUBA PLATINUM | R$ 20", "prod_NUBAPLATINUM|20"),
+        ("PLATINUM | R$ 25",      "prod_PLATINUM|25"),
+        ("PREPAID | R$ 29",       "prod_PREPAID|29"),
+        ("SIGNATURE | R$ 20",     "prod_SIGNATURE|20"),
+        ("STANDARD | R$ 15",      "prod_STANDARD|15"),
+        ("TRAD REWARDS | R$ 20",  "prod_TRADREWARDS|20"),
+        ("WORLD | R$ 20",         "prod_WORLD|20"),
+    ]
+    botoes = [InlineKeyboardButton(t, callback_data=d) for t, d in produtos]
+    for i in range(0, len(botoes), 2):
+        if i + 1 < len(botoes):
+            markup.row(botoes[i], botoes[i+1])
+        else:
+            markup.add(botoes[i])
+    markup.add(InlineKeyboardButton("💰 Adicionar saldo", callback_data="saldo"))
+    markup.add(InlineKeyboardButton("⬅️ Voltar", callback_data="voltar"))
+    return markup
+
+def menu_adm():
+    markup = InlineKeyboardMarkup()
+    btn_saldo = InlineKeyboardButton("💼 Saldo API", callback_data="adm_saldo")
+    btn_hist  = InlineKeyboardButton("📋 Histórico", callback_data="adm_hist")
+    btn_add_cc = InlineKeyboardButton("➕ Add Cartão", callback_data="adm_add_cc")
+    btn_rem_cc = InlineKeyboardButton("➖ Limpar Categoria", callback_data="adm_rem_cc")
+    btn_voltar = InlineKeyboardButton("⬅️ Voltar", callback_data="voltar")
+    markup.row(btn_saldo, btn_hist)
+    markup.row(btn_add_cc, btn_rem_cc)
+    markup.add(btn_voltar)
+    return markup
+
+# ─────────────────────────────────────────────
+# INTEGRAÇÃO API - SALDO DO PRODUTOR
+# ─────────────────────────────────────────────
+POSEIDON_BALANCE_URL = 'https://app.poseidonpay.site/api/v1/gateway/producer/balance'
+
+def consultar_saldo() -> dict:
+    """Consulta o saldo atual da conta do produtor na PoseidonPay."""
+    headers = {
+        'x-public-key': PUBLIC_KEY,
+        'x-secret-key': SECRET_KEY,
+        'Content-Type': 'application/json'
+    }
+    try:
+        resp = requests.get(POSEIDON_BALANCE_URL, headers=headers, timeout=10)
+        return resp.json()
+    except requests.exceptions.Timeout:
+        return {"error": "timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+import random
+
+def gerar_cpf_valido():
+    cpf = [random.randint(0, 9) for _ in range(9)]
+    for _ in range(2):
+        val = sum([(len(cpf) + 1 - i) * v for i, v in enumerate(cpf)]) % 11
+        cpf.append(11 - val if val > 1 else 0)
+    return ''.join(map(str, cpf))
+
+# ─────────────────────────────────────────────
+# INTEGRAÇÃO PIX - POSEIDONPAY
+# ─────────────────────────────────────────────
+def gerar_pix(valor: float, user_id: int, user_name: str) -> dict:
+    """Chama a API da PoseidonPay e retorna o resultado."""
+    headers = {
+        'x-public-key': PUBLIC_KEY,
+        'x-secret-key': SECRET_KEY,
+        'Content-Type': 'application/json'
+    }
+    body = {
+        "identifier": str(uuid.uuid4()),
+        "amount": valor,
+        "client": {
+            "name":  user_name or f"Usuario_{user_id}",
+            "email": f"user{user_id}@telegram.com",
+            "phone": "(11) 99999-9999",
+            "document": gerar_cpf_valido()
+        },
+        "metadata": {
+            "provider": "TelegramBot",
+            "orderId":  str(user_id)
+        }
+    }
+    try:
+        resp = requests.post(POSEIDON_URL, json=body, headers=headers, timeout=15)
+        return resp.json()
+    except requests.exceptions.Timeout:
+        return {"error": "timeout"}
+    except Exception as e:
+        return {"error": str(e)}
+
+def enviar_pix_ao_usuario(chat_id: int, valor: float, resultado: dict):
+    """Envia o QR Code e código Pix ao usuário após geração."""
+    if resultado.get("status") in ("OK", "PENDING"):
+        pix   = resultado.get("pix", {})
+        code  = pix.get("code", "")
+        image = pix.get("image", "")
+
+        texto = (
+            f"✅ *Cobrança Pix gerada com sucesso!*\n\n"
+            f"💰 *Valor:* R$ {valor:.2f}\n\n"
+            f"📋 *Copia e Cola:*\n`{code}`\n\n"
+            f"_Após o pagamento seu saldo será creditado automaticamente._"
+        )
+
+        if image:
+            try:
+                bot.send_photo(chat_id, image, caption=texto, parse_mode="Markdown")
+            except Exception:
+                bot.send_message(chat_id, texto, parse_mode="Markdown")
+        else:
+            bot.send_message(chat_id, texto, parse_mode="Markdown")
+
+    elif resultado.get("error"):
+        bot.send_message(
+            chat_id,
+            f"❌ Erro ao conectar com a API: `{resultado['error']}`\nTente novamente mais tarde.",
+            parse_mode="Markdown"
+        )
+    else:
+        # Pega toda a resposta para debug
+        raw_resp = str(resultado)
+        bot.send_message(chat_id, f"❌ Falha ao gerar Pix. Resposta da API:\n`{raw_resp}`", parse_mode="Markdown")
+
+# ─────────────────────────────────────────────
+# HANDLERS DE MENSAGEM
+# ─────────────────────────────────────────────
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    global DONO_CHAT_ID
+    user  = message.from_user
+    nome  = user.first_name or "Usuário"
+    uname = user.username or ""
+
+    # Captura automaticamente o chat_id do dono
+    if user.id == DONO_ID:
+        DONO_CHAT_ID = message.chat.id
+
+    user_state.pop(message.chat.id, None)
+
+    # Registra no histórico
+    registrar_evento(user.id, nome, uname, "entrou no bot")
+
+    # Notifica o dono
+    notificar_dono(
+        f"🔔 *Novo usuário no bot!*\n\n"
+        f"👤 Nome: {nome}\n"
+        f"🆔 ID: `{user.id}`\n"
+        f"📱 Username: @{uname if uname else 'sem @'}\n"
+        f"🕐 Horário: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        f"👋 Olá, *{nome}*! Bem-vindo. Escolha uma opção abaixo:",
+        reply_markup=menu_principal(uname),
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['adm'])
+def cmd_adm(message):
+    """Comando exclusivo do dono para abrir o Painel ADM."""
+    if message.from_user.id != DONO_ID:
+        bot.send_message(message.chat.id, "❌ Você não tem permissão para usar este comando.")
+        return
+    bot.send_message(
+        message.chat.id,
+        "🛠️ *Painel do Administrador*\n\nEscolha uma opção:",
+        parse_mode="Markdown",
+        reply_markup=menu_adm()
+    )
+
+@bot.message_handler(commands=['aviso'])
+def cmd_aviso(message):
+    """Comando exclusivo do dono para enviar mensagem para todos os usuários."""
+    if message.from_user.id != DONO_ID:
+        bot.send_message(message.chat.id, "❌ Você não tem permissão para usar este comando.")
+        return
+        
+    texto = message.text.replace("/aviso", "").strip()
+    if not texto:
+        bot.send_message(message.chat.id, "⚠️ Uso correto: `/aviso sua mensagem aqui`", parse_mode="Markdown")
+        return
+        
+    historico = carregar_historico()
+    usuarios = set([ev["user_id"] for ev in historico if "user_id" in ev])
+    
+    if not usuarios:
+        bot.send_message(message.chat.id, "⚠️ Nenhum usuário encontrado no histórico.")
+        return
+        
+    enviados = 0
+    falhas = 0
+    msg_wait = bot.send_message(message.chat.id, f"⏳ Enviando aviso para {len(usuarios)} usuários...")
+    
+    for uid in usuarios:
+        try:
+            bot.send_message(uid, f"📢 *Aviso do Administrador:*\n\n{texto}", parse_mode="Markdown")
+            enviados += 1
+        except Exception:
+            falhas += 1
+            
+    bot.edit_message_text(
+        f"✅ *Aviso enviado!*\n\n"
+        f"Sucesso: `{enviados}`\n"
+        f"Falhas: `{falhas}` (bloquearam o bot)",
+        chat_id=message.chat.id,
+        message_id=msg_wait.message_id,
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['historico'])
+def cmd_historico(message):
+    """Comando exclusivo do dono para ver o histórico de usuários."""
+    if message.from_user.id != DONO_ID:
+        bot.send_message(message.chat.id, "❌ Você não tem permissão para usar este comando.")
+        return
+
+    historico = carregar_historico()
+    if not historico:
+        bot.send_message(message.chat.id, "📋 Histórico vazio.")
+        return
+
+    # Mostra os últimos 20 eventos
+    ultimos = historico[-20:]
+    linhas = ["📋 *Histórico (últimos eventos):*\n"]
+    for ev in reversed(ultimos):
+        linhas.append(
+            f"🕐 `{ev['data']}`\n"
+            f"👤 {ev['nome']} ({ev['username']}) — ID: `{ev['user_id']}`\n"
+            f"📌 *{ev['acao']}*" + (f": {ev['detalhe']}" if ev['detalhe'] else "") + "\n"
+        )
+
+    texto = "\n".join(linhas)
+
+    # Telegram tem limite de 4096 chars por mensagem
+    if len(texto) > 4000:
+        texto = texto[:4000] + "\n\n_...lista truncada_"
+
+    bot.send_message(message.chat.id, texto, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['meusaldo'])
+def cmd_meu_saldo(message):
+    """Comando exclusivo do dono para checar o saldo na PoseidonPay."""
+    if message.from_user.id != DONO_ID:
+        bot.send_message(message.chat.id, "❌ Você não tem permissão para usar este comando.")
+        return
+
+    msg_wait = bot.send_message(message.chat.id, "⏳ Consultando saldo, aguarde...")
+    dados = consultar_saldo()
+    try:
+        bot.delete_message(message.chat.id, msg_wait.message_id)
+    except Exception:
+        pass
+
+    if dados.get("error"):
+        bot.send_message(
+            message.chat.id,
+            f"❌ Erro ao consultar saldo: `{dados['error']}`",
+            parse_mode="Markdown"
+        )
+    else:
+        disponivel = dados.get("available", 0)
+        pendente   = dados.get("pending", 0)
+        retido     = dados.get("fundLock", 0)
+        bot.send_message(
+            message.chat.id,
+            f"💼 *Saldo PoseidonPay*\n\n"
+            f"💰 *Disponível:* R$ {disponivel:.2f}\n"
+            f"⏳ *Pendente:* R$ {pendente:.2f}\n"
+            f"🔒 *Retido:* R$ {retido:.2f}",
+            parse_mode="Markdown"
+        )
+
+@bot.message_handler(func=lambda m: True)
+def handle_text(message):
+    chat_id = message.chat.id
+    estado  = user_state.get(chat_id)
+
+    if estado == "aguardando_cat_add":
+        cat = message.text.strip().upper()
+        user_state[chat_id] = {"estado": "aguardando_ccs_add", "categoria": cat}
+        bot.send_message(
+            chat_id,
+            f"Categoria selecionada: *{cat}*\n"
+            "Agora envie vários cartões na mesma mensagem, separados por nova linha, vírgula ou ponto e vírgula.",
+            parse_mode="Markdown"
+        )
+        return
+
+    if type(estado) is dict and estado.get("estado") == "aguardando_ccs_add":
+        cat = estado["categoria"]
+        linhas = [item.strip() for item in re.split(r"[\n,;]+", message.text) if item.strip()]
+        
+        db.adicionar_cartoes_estoque(cat, linhas)
+            
+        user_state.pop(chat_id, None)
+        bot.send_message(chat_id, f"✅ Adicionados {len(linhas)} cartões à categoria *{cat}*!", parse_mode="Markdown")
+        return
+
+    if estado == "aguardando_cat_rem":
+        cat = message.text.strip().upper()
+        db.limpar_categoria_estoque(cat)
+        if cat == "TUDO":
+            bot.send_message(chat_id, "✅ Todo o estoque foi zerado!", parse_mode="Markdown")
+        else:
+            bot.send_message(chat_id, f"✅ A categoria *{cat}* foi limpa!", parse_mode="Markdown")
+            
+        user_state.pop(chat_id, None)
+        return
+
+    if estado == "aguardando_valor_saldo":
+        texto = re.sub(r'[^\d.,]', '', message.text.strip()).replace(',', '.')
+        try:
+            valor = float(texto)
+            if valor <= 0:
+                raise ValueError("zero")
+        except ValueError:
+            bot.send_message(chat_id, "⚠️ Valor inválido. Digite apenas números. Ex: *50* ou *29.90*", parse_mode="Markdown")
+            return
+
+        if valor < 15:
+            bot.send_message(chat_id, "⚠️ O valor mínimo para adicionar saldo é *R$ 15,00*.", parse_mode="Markdown")
+            return
+
+        user_state.pop(chat_id, None)
+
+        nome = message.from_user.first_name or "Usuário"
+        uname = message.from_user.username or ""
+        msg_aguarde = bot.send_message(chat_id, "⏳ Gerando seu Pix, aguarde...")
+
+        resultado = gerar_pix(valor, chat_id, nome)
+
+        try:
+            bot.delete_message(chat_id, msg_aguarde.message_id)
+        except Exception:
+            pass
+
+        # Registra no histórico e notifica o dono
+        if resultado.get("status") in ("OK", "PENDING"):
+            registrar_evento(chat_id, nome, uname, "gerou Pix", f"R$ {valor:.2f}")
+            notificar_dono(
+                f"💰 *Novo Pix gerado!*\n\n"
+                f"👤 Nome: {nome}\n"
+                f"📱 Username: @{uname if uname else 'sem @'}\n"
+                f"🆔 ID: `{chat_id}`\n"
+                f"💵 Valor: R$ {valor:.2f}\n"
+                f"🕐 Horário: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+            )
+        else:
+            registrar_evento(chat_id, nome, uname, "falha ao gerar Pix", f"R$ {valor:.2f}")
+
+        enviar_pix_ao_usuario(chat_id, valor, resultado)
+        bot.send_message(chat_id, "Menu principal:", reply_markup=menu_principal(message.from_user.username or ""))
+
+# ─────────────────────────────────────────────
+# CALLBACKS DOS BOTÕES
+# ─────────────────────────────────────────────
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    chat_id = call.message.chat.id
+    uname = call.from_user.username or ""
+
+    if call.data == "comprar":
+        tabela = (
+            "💳 *Produtos disponíveis:*\n\n"
+            "```\n"
+            "Tipo           | Valor \n"
+            "---------------+-------\n"
+            "AMEX           | R$ 30 \n"
+            "B2B            | R$ 20 \n"
+            "BLACK          | R$ 30 \n"
+            "BUSINESS       | R$ 20 \n"
+            "CLASSIC        | R$ 15 \n"
+            "CORPORATE      | R$ 30 \n"
+            "ELECTRON       | R$ 20 \n"
+            "ELO            | R$ 40 \n"
+            "GOLD           | R$ 15 \n"
+            "INDEFINIDO     | R$ 20 \n"
+            "INFINITE       | R$ 30 \n"
+            "NUBA GOLD      | R$ 15 \n"
+            "NUBA PLATINUM  | R$ 20 \n"
+            "PLATINUM       | R$ 25 \n"
+            "PREPAID        | R$ 29 \n"
+            "SIGNATURE      | R$ 20 \n"
+            "STANDARD       | R$ 15 \n"
+            "TRAD REWARDS   | R$ 20 \n"
+            "WORLD          | R$ 20 \n"
+            "```\n\n"
+            "Selecione o tipo de cartão abaixo:"
+        )
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=tabela,
+            parse_mode="Markdown",
+            reply_markup=menu_produtos()
+        )
+
+    elif call.data == "voltar":
+        user_state.pop(chat_id, None)
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text="👋 Olá! Bem-vindo. Escolha uma opção abaixo:",
+            reply_markup=menu_principal(uname)
+        )
+
+
+
+    elif call.data == "adm_saldo":
+        if call.from_user.id != DONO_ID:
+            return
+        bot.answer_callback_query(call.id, "Consultando saldo...")
+        dados = consultar_saldo()
+        if dados.get("error"):
+            texto = f"❌ Erro: `{dados['error']}`"
+        else:
+            disponivel = dados.get("available", 0)
+            pendente   = dados.get("pending", 0)
+            retido     = dados.get("fundLock", 0)
+            texto = (
+                f"💼 *Saldo PoseidonPay*\n\n"
+                f"💰 *Disponível:* R$ {disponivel:.2f}\n"
+                f"⏳ *Pendente:* R$ {pendente:.2f}\n"
+                f"🔒 *Retido:* R$ {retido:.2f}"
+            )
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=texto,
+            parse_mode="Markdown",
+            reply_markup=menu_adm()
+        )
+
+    elif call.data == "adm_hist":
+        if call.from_user.id != DONO_ID:
+            return
+        bot.answer_callback_query(call.id)
+        historico = carregar_historico()
+        if not historico:
+            texto = "📋 Histórico vazio."
+        else:
+            ultimos = historico[-15:]
+            linhas = ["📋 *Últimos eventos:*\n"]
+            for ev in reversed(ultimos):
+                linhas.append(
+                    f"🕐 `{ev['data']}` | 👤 {ev['nome']} | 📌 {ev['acao']} {ev['detalhe']}"
+                )
+            texto = "\n".join(linhas)
+            if len(texto) > 4000:
+                texto = texto[:4000] + "\n..."
+        
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text=texto,
+            parse_mode="Markdown",
+            reply_markup=menu_adm()
+        )
+
+    elif call.data == "adm_add_cc":
+        if call.from_user.id != DONO_ID:
+            return
+        user_state[chat_id] = "aguardando_cat_add"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "➕ *Adicionar Cartões*\n\n"
+            "Digite a Categoria do cartão que deseja adicionar.\n"
+            "Exemplo: *AMEX*",
+            parse_mode="Markdown"
+        )
+
+    elif call.data == "adm_rem_cc":
+        if call.from_user.id != DONO_ID:
+            return
+        user_state[chat_id] = "aguardando_cat_rem"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "➖ *Remover Cartões*\n\n"
+            "Digite a Categoria para limpar (remover todos dessa categoria). Exemplo: *AMEX*\n"
+            "Se quiser zerar o estoque todo, digite *TUDO*.",
+            parse_mode="Markdown"
+        )
+
+    elif call.data == "saldo":
+        user_state[chat_id] = "aguardando_valor_saldo"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "💰 *Adicionar Saldo via Pix*\n\n"
+            "Digite o valor que deseja adicionar (em reais):\n"
+            "Valor mínimo: *R$ 15,00*\n"
+            "Exemplo: `50` ou `29.90`",
+            parse_mode="Markdown"
+        )
+
+    elif call.data == "conta":
+        bot.answer_callback_query(call.id)
+        msg_wait = bot.send_message(chat_id, "⏳ Consultando saldo, aguarde...")
+        dados = consultar_saldo()
+        try:
+            bot.delete_message(chat_id, msg_wait.message_id)
+        except Exception:
+            pass
+
+        if dados.get("error"):
+            bot.send_message(
+                chat_id,
+                f"❌ Erro ao consultar saldo: `{dados['error']}`",
+                parse_mode="Markdown"
+            )
+        else:
+            disponivel = dados.get("available", 0)
+            pendente   = dados.get("pending", 0)
+            retido     = dados.get("fundLock", 0)
+            bot.send_message(
+                chat_id,
+                f"👤 *Minha Conta*\n\n"
+                f"ID: `{call.from_user.id}`\n"
+                f"Nome: {call.from_user.first_name}\n\n"
+                f"💰 *Saldo disponível:* R$ {disponivel:.2f}\n"
+                f"⏳ *Saldo pendente:* R$ {pendente:.2f}\n"
+                f"🔒 *Saldo retido:* R$ {retido:.2f}",
+                parse_mode="Markdown"
+            )
+
+    elif call.data.startswith("prod_"):
+        partes     = call.data.replace("prod_", "").split("|")
+        nome_prod  = partes[0] if len(partes) > 0 else "Produto"
+        preco_prod = partes[1] if len(partes) > 1 else "?"
+        
+        estoque_val = db.obter_quantidade_estoque(nome_prod)
+
+        if estoque_val <= 0:
+            bot.answer_callback_query(call.id, "Produto sem estoque!")
+            bot.send_message(
+                chat_id,
+                f"⚠️ Ops! Não temos cartões *{nome_prod}* no estoque no momento.\n"
+                "Por favor, volte mais tarde.",
+                parse_mode="Markdown"
+            )
+        else:
+            saldo = saldo_usuario(call.from_user.id)
+            preco = float(preco_prod.replace(',', '.'))
+            if saldo < preco:
+                bot.answer_callback_query(call.id, "Saldo insuficiente")
+                markup = InlineKeyboardMarkup()
+                markup.add(InlineKeyboardButton("💰 Adicionar saldo", callback_data="saldo"))
+                markup.add(InlineKeyboardButton("⬅️ Voltar", callback_data="voltar"))
+                bot.send_message(
+                    chat_id,
+                    f"💳 *{nome_prod}* custa R$ {preco:.2f}.\n"
+                    f"Seu saldo atual é R$ {saldo:.2f}.\n\n"
+                    "Adicione saldo para continuar a compra:",
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+                return
+
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                chat_id,
+                f"🛒 Você selecionou: *{nome_prod}* | R$ {preco_prod}\n\n"
+                "Adicione saldo via 💰 *Adicionar saldo* e então contate o suporte.",
+                parse_mode="Markdown"
+            )
+
+# ─────────────────────────────────────────────
+# INICIALIZAÇÃO E SERVIDOR WEB FALSO PARA A RENDER
+# ─────────────────────────────────────────────
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import os
+
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot rodando com sucesso!")
+
+def keep_alive():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    server.serve_forever()
+
+print("Iniciando servidor web falso para a Render...")
+threading.Thread(target=keep_alive, daemon=True).start()
+
+print("Bot iniciado com sucesso!")
+bot.infinity_polling()
