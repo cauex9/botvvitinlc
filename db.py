@@ -276,8 +276,7 @@ def criar_ticket(codigo: str, valor: float) -> tuple:
             }).execute()
             return True, f"✅ Ticket *{codigo}* no valor de *R$ {valor:.2f}* foi criado com sucesso!"
         except Exception as e:
-            print(f"Erro ao criar ticket no Supabase: {e}")
-            return False, f"Erro ao salvar no banco de dados: {e}"
+            print(f"[DB] Erro no Supabase (usando fallback local para criar_ticket): {e}")
 
     # Fallback local
     tickets = {}
@@ -312,28 +311,25 @@ def resgatar_ticket(codigo: str, user_id: int) -> tuple:
     if supabase:
         try:
             res = supabase.table("tickets").select("*").eq("codigo", codigo).execute()
-            if not res.data or len(res.data) == 0:
-                return False, "❌ Ticket não encontrado ou código inválido!", 0.0
-            
-            t = res.data[0]
-            if t.get("usado"):
-                return False, "❌ Este ticket já foi resgatado por outra pessoa!", 0.0
+            if res.data and len(res.data) > 0:
+                t = res.data[0]
+                if t.get("usado"):
+                    return False, "❌ Este ticket já foi resgatado por outra pessoa!", 0.0
 
-            valor = float(t.get("valor", 0))
+                valor = float(t.get("valor", 0))
 
-            # Atualiza ticket como usado no Supabase
-            supabase.table("tickets").update({
-                "usado": True,
-                "usado_por": user_id,
-                "usado_em": now_iso
-            }).eq("id", t["id"]).execute()
+                # Atualiza ticket como usado no Supabase
+                supabase.table("tickets").update({
+                    "usado": True,
+                    "usado_por": user_id,
+                    "usado_em": now_iso
+                }).eq("id", t["id"]).execute()
 
-            # Credita o saldo ao usuário
-            adicionar_saldo(user_id, valor)
-            return True, f"🎉 *Ticket resgatado com sucesso!*\n\n💰 *R$ {valor:.2f}* foram creditados na sua conta.", valor
+                # Credita o saldo ao usuário
+                adicionar_saldo(user_id, valor)
+                return True, f"🎉 *Ticket resgatado com sucesso!*\n\n💰 *R$ {valor:.2f}* foram creditados na sua conta.", valor
         except Exception as e:
-            print(f"Erro ao resgatar ticket no Supabase: {e}")
-            return False, f"Erro ao processar resgate no banco de dados: {e}", 0.0
+            print(f"[DB] Erro ao resgatar ticket no Supabase (usando fallback local): {e}")
 
     # Fallback local
     if os.path.exists(TICKETS_FILE):
@@ -362,6 +358,7 @@ def resgatar_ticket(codigo: str, user_id: int) -> tuple:
 
     adicionar_saldo(user_id, valor)
     return True, f"🎉 *Ticket resgatado com sucesso!*\n\n💰 *R$ {valor:.2f}* foram creditados na sua conta.", valor
+
 
 
 
