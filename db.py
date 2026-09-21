@@ -22,6 +22,8 @@ if SUPABASE_URL and SUPABASE_KEY:
 HISTORICO_FILE = 'historico.json'
 SALDOS_FILE = 'saldos.json'
 ESTOQUE_FILE = 'estoque.json'
+TICKETS_FILE = 'tickets.json'
+
 
 
 # ─────────────────────────────────────────────
@@ -200,10 +202,223 @@ def limpar_categoria_estoque(categoria: str) -> int:
         json.dump(estoque, f, indent=2)
     return True
 
+def obter_cartoes_detalhados_categoria(categoria: str) -> list:
+    """Retorna a lista de cartões da categoria especificada contendo o ID e conteúdo."""
+    categoria = categoria.upper()
+    if supabase:
+        try:
+            res = supabase.table("estoque").select("id, conteudo").eq("categoria", categoria).order("id").execute()
+            if res.data:
+                return res.data
+            return []
+        except Exception as e:
+            print(f"Erro ao obter cartões detalhados no Supabase: {e}")
+
+    # Fallback local
+    estoque = carregar_estoque()
+    itens = estoque.get(categoria, [])
+    if isinstance(itens, list):
+        return [{"id": idx + 1, "conteudo": c} for idx, c in enumerate(itens)]
+    return []
+
+def remover_cartao_por_indice(categoria: str, indice: int) -> tuple:
+    """Remove um cartão pelo índice (1-indexed) da categoria. Retorna (sucesso, mensagem_ou_conteudo)."""
+    categoria = categoria.upper()
+    cartoes = obter_cartoes_detalhados_categoria(categoria)
+    if not cartoes or indice < 1 or indice > len(cartoes):
+        return False, "Índice inválido ou categoria sem cartões."
+
+    item = cartoes[indice - 1]
+    
+    if supabase:
+        try:
+            item_id = item["id"]
+            conteudo = item["conteudo"]
+            supabase.table("estoque").delete().eq("id", item_id).execute()
+            return True, conteudo
+        except Exception as e:
+            print(f"Erro ao remover cartão por índice no Supabase: {e}")
+            return False, f"Erro no banco de dados: {e}"
+
+    # Fallback local
+    estoque = carregar_estoque()
+    if categoria in estoque and isinstance(estoque[categoria], list):
+        if 0 <= (indice - 1) < len(estoque[categoria]):
+            removido = estoque[categoria].pop(indice - 1)
+            with open(ESTOQUE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(estoque, f, indent=2)
+            return True, removido
+
+    return False, "Não foi possível remover o cartão."
+
+
+# ─────────────────────────────────────────────
+# TICKETS (CUPONS DE SALDO)
+# ─────────────────────────────────────────────
+def criar_ticket(codigo: str, valor: float) -> tuple:
+    """Cria um novo ticket com o código e valor especificados."""
+    codigo = codigo.strip().upper()
+    if not codigo:
+        return False, "Código de ticket inválido."
+    if valor <= 0:
+        return False, "O valor do ticket deve ser maior que zero."
+
+    if supabase:
+        try:
+            res = supabase.table("tickets").select("id").eq("codigo", codigo).execute()
+            if res.data and len(res.data) > 0:
+                return False, f"Já existe um ticket com o código *{codigo}*!"
+            
+            supabase.table("tickets").insert({
+                "codigo": codigo,
+                "valor": round(valor, 2),
+                "usado": False
+            }).execute()
+            return True, f"✅ Ticket *{codigo}* no valor de *R$ {valor:.2f}* foi criado com sucesso!"
+        except Exception as e:
+            print(f"Erro ao criar ticket no Supabase: {e}")
+            return False, f"Erro ao salvar no banco de dados: {e}"
+
+    # Fallback local
+    tickets = {}
+    if os.path.exists(TICKETS_FILE):
+        try:
+            with open(TICKETS_FILE, 'r', encoding='utf-8') as f:
+                tickets = json.load(f)
+        except Exception:
+            pass
+
+    if codigo in tickets:
+        return False, f"Já existe um ticket com o código *{codigo}*!"
+
+    tickets[codigo] = {
+        "valor": round(valor, 2),
+        "usado": False,
+        "usado_por": None,
+        "usado_em": None
+    }
+
+    with open(TICKETS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(tickets, f, indent=2)
+
+    return True, f"✅ Ticket *{codigo}* no valor de *R$ {valor:.2f}* foi criado com sucesso!"
+
+def resgatar_ticket(codigo: str, user_id: int) -> tuple:
+    """Tenta resgatar um ticket para o usuário. Retorna (sucesso, mensagem, valor)."""
+    codigo = codigo.strip().upper()
+    now_iso = datetime.now().isoformat()
+    now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+    if supabase:
+        try:
+            res = supabase.table("tickets").select("*").eq("codigo", codigo).execute()
+            if not res.data or len(res.data) == 0:
+                return False, "❌ Ticket não encontrado ou código inválido!", 0.0
+            
+            t = res.data[0]
+            if t.get("usado"):
+                return False, "❌ Este ticket já foi resgatado por outra pessoa!", 0.0
+
+            valor = float(t.get("valor", 0))
+
+            # Atualiza ticket como usado no Supabase
+            supabase.table("tickets").update({
+                "usado": True,
+                "usado_por": user_id,
+                "usado_em": now_iso
+            }).eq("id", t["id"]).execute()
+
+            # Credita o saldo ao usuário
+            adicionar_saldo(user_id, valor)
+            return True, f"🎉 *Ticket resgatado com sucesso!*\n\n💰 *R$ {valor:.2f}* foram creditados na sua conta.", valor
+        except Exception as e:
+            print(f"Erro ao resgatar ticket no Supabase: {e}")
+            return False, f"Erro ao processar resgate no banco de dados: {e}", 0.0
+
+    # Fallback local
+    if os.path.exists(TICKETS_FILE):
+        try:
+            with open(TICKETS_FILE, 'r', encoding='utf-8') as f:
+                tickets = json.load(f)
+        except Exception:
+            tickets = {}
+    else:
+        tickets = {}
+
+    if codigo not in tickets:
+        return False, "❌ Ticket não encontrado ou código inválido!", 0.0
+
+    t = tickets[codigo]
+    if t.get("usado"):
+        return False, "❌ Este ticket já foi resgatado por outra pessoa!", 0.0
+
+    valor = float(t.get("valor", 0))
+    t["usado"] = True
+    t["usado_por"] = user_id
+    t["usado_em"] = now_str
+
+    with open(TICKETS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(tickets, f, indent=2)
+
+    adicionar_saldo(user_id, valor)
+    return True, f"🎉 *Ticket resgatado com sucesso!*\n\n💰 *R$ {valor:.2f}* foram creditados na sua conta.", valor
+
+
 
 # ─────────────────────────────────────────────
 # HISTÓRICO
 # ─────────────────────────────────────────────
+def obter_todos_usuarios() -> set:
+    """Retorna um conjunto com todos os IDs de usuários únicos cadastrados no histórico e nos saldos."""
+    usuarios = set()
+    
+    if supabase:
+        try:
+            res_h = supabase.table("historico").select("user_id").execute()
+            if res_h.data:
+                for row in res_h.data:
+                    if row.get("user_id"):
+                        usuarios.add(int(row["user_id"]))
+        except Exception as e:
+            print(f"Erro ao buscar usuarios do historico no Supabase: {e}")
+            
+        try:
+            res_s = supabase.table("saldos").select("user_id").execute()
+            if res_s.data:
+                for row in res_s.data:
+                    if row.get("user_id"):
+                        usuarios.add(int(row["user_id"]))
+        except Exception as e:
+            print(f"Erro ao buscar usuarios dos saldos no Supabase: {e}")
+
+    # Fallback local / complemento com arquivos JSON caso existam
+    if os.path.exists(HISTORICO_FILE):
+        try:
+            with open(HISTORICO_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    for ev in data:
+                        if isinstance(ev, dict) and ev.get("user_id"):
+                            usuarios.add(int(ev["user_id"]))
+        except Exception:
+            pass
+            
+    if os.path.exists(SALDOS_FILE):
+        try:
+            with open(SALDOS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    for uid in data.keys():
+                        try:
+                            usuarios.add(int(uid))
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+
+    return usuarios
+
+
 def carregar_historico() -> list:
     """Carrega o histórico de eventos."""
     if supabase:

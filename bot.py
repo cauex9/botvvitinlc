@@ -51,6 +51,9 @@ def saldo_usuario(user_id: int) -> float:
 def carregar_historico() -> list:
     return db.carregar_historico()
 
+def obter_todos_usuarios() -> set:
+    return db.obter_todos_usuarios()
+
 def registrar_evento(user_id: int, nome: str, username: str, acao: str, detalhe: str = ""):
     db.registrar_evento(user_id, nome, username, acao, detalhe)
 
@@ -73,9 +76,11 @@ def menu_principal(username=""):
     btn_comprar = InlineKeyboardButton("💳 Comprar CC", callback_data="comprar")
     btn_conta   = InlineKeyboardButton("👤 Minha conta", callback_data="conta")
     btn_saldo   = InlineKeyboardButton("💰 Adicionar saldo", callback_data="saldo")
+    btn_ticket  = InlineKeyboardButton("🎟️ Resgatar Ticket", callback_data="resgatar_ticket")
     btn_dono    = InlineKeyboardButton("👑 Dono", url=f"tg://user?id={DONO_ID}")
     markup.add(btn_comprar)
     markup.row(btn_conta, btn_saldo)
+    markup.add(btn_ticket)
     markup.add(btn_dono)
 
     return markup
@@ -118,12 +123,38 @@ def menu_adm():
     btn_saldo = InlineKeyboardButton("💼 Saldo API", callback_data="adm_saldo")
     btn_hist  = InlineKeyboardButton("📋 Histórico", callback_data="adm_hist")
     btn_add_cc = InlineKeyboardButton("➕ Add Cartão", callback_data="adm_add_cc")
-    btn_rem_cc = InlineKeyboardButton("➖ Limpar Categoria", callback_data="adm_rem_cc")
+    btn_rem_cc = InlineKeyboardButton("📦 Estoque / Remover CC", callback_data="adm_rem_cc")
+    btn_ticket = InlineKeyboardButton("🎟️ Criar Ticket", callback_data="adm_criar_ticket")
     btn_voltar = InlineKeyboardButton("⬅️ Voltar", callback_data="voltar")
     markup.row(btn_saldo, btn_hist)
     markup.row(btn_add_cc, btn_rem_cc)
+    markup.add(btn_ticket)
     markup.add(btn_voltar)
     return markup
+
+def menu_categorias_estoque():
+    markup = InlineKeyboardMarkup()
+    categorias = [
+        "AMEX", "B2B", "BLACK", "BUSINESS", "CLASSIC", "CORPORATE",
+        "ELECTRON", "ELO", "GOLD", "INDEFINIDO", "INFINITE", "NUBA GOLD",
+        "NUBA PLATINUM", "PLATINUM", "PREPAID", "SIGNATURE", "STANDARD",
+        "TRAD REWARDS", "WORLD"
+    ]
+    botoes = []
+    for cat in categorias:
+        qtd = db.obter_quantidade_estoque(cat)
+        cat_clean = cat.replace(" ", "")
+        botoes.append(InlineKeyboardButton(f"{cat} ({qtd})", callback_data=f"adm_cat_rem_{cat_clean}"))
+        
+    for i in range(0, len(botoes), 2):
+        if i + 1 < len(botoes):
+            markup.row(botoes[i], botoes[i+1])
+        else:
+            markup.add(botoes[i])
+            
+    markup.add(InlineKeyboardButton("⬅️ Voltar ao ADM", callback_data="adm_voltar_menu"))
+    return markup
+
 
 # ─────────────────────────────────────────────
 # INTEGRAÇÃO API - SALDO DO PRODUTOR
@@ -270,20 +301,21 @@ def cmd_adm(message):
 @bot.message_handler(commands=['aviso'])
 def cmd_aviso(message):
     """Comando exclusivo do dono para enviar mensagem para todos os usuários."""
+    import time
     if message.from_user.id != DONO_ID:
         bot.send_message(message.chat.id, "❌ Você não tem permissão para usar este comando.")
         return
         
-    texto = message.text.replace("/aviso", "").strip()
-    if not texto:
+    partes = message.text.split(maxsplit=1)
+    if len(partes) < 2 or not partes[1].strip():
         bot.send_message(message.chat.id, "⚠️ Uso correto: `/aviso sua mensagem aqui`", parse_mode="Markdown")
         return
         
-    historico = carregar_historico()
-    usuarios = set([ev["user_id"] for ev in historico if "user_id" in ev])
+    texto = partes[1].strip()
+    usuarios = obter_todos_usuarios()
     
     if not usuarios:
-        bot.send_message(message.chat.id, "⚠️ Nenhum usuário encontrado no histórico.")
+        bot.send_message(message.chat.id, "⚠️ Nenhum usuário encontrado no histórico ou banco de dados.")
         return
         
     enviados = 0
@@ -295,7 +327,13 @@ def cmd_aviso(message):
             bot.send_message(uid, f"📢 *Aviso do Administrador:*\n\n{texto}", parse_mode="Markdown")
             enviados += 1
         except Exception:
-            falhas += 1
+            try:
+                # Tenta enviar como texto puro se o Markdown falhar por causa de caracteres especiais (ex: _, *, `, [)
+                bot.send_message(uid, f"📢 Aviso do Administrador:\n\n{texto}")
+                enviados += 1
+            except Exception:
+                falhas += 1
+        time.sleep(0.04)  # Evita bloqueio por limite de taxa do Telegram (rate limit)
             
     bot.edit_message_text(
         f"✅ *Aviso enviado!*\n\n"
@@ -370,12 +408,122 @@ def cmd_meu_saldo(message):
             parse_mode="Markdown"
         )
 
+@bot.message_handler(commands=['criarticket'])
+def cmd_criar_ticket(message):
+    """Comando exclusivo do dono para criar um ticket de saldo."""
+    if message.from_user.id != DONO_ID:
+        bot.send_message(message.chat.id, "❌ Você não tem permissão para usar este comando.")
+        return
+        
+    partes = message.text.split()
+    if len(partes) < 3:
+        bot.send_message(message.chat.id, "⚠️ Uso correto: `/criarticket CODIGO VALOR` (ex: `/criarticket PROMO10 15`)", parse_mode="Markdown")
+        return
+        
+    codigo = partes[1].strip()
+    try:
+        valor = float(partes[2].replace(',', '.'))
+    except ValueError:
+        bot.send_message(message.chat.id, "⚠️ Valor inválido. Digite apenas números para o valor. Ex: `15` ou `29.90`", parse_mode="Markdown")
+        return
+        
+    ok, msg = db.criar_ticket(codigo, valor)
+    bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+
+@bot.message_handler(commands=['resgatar'])
+def cmd_resgatar(message):
+    """Comando para o usuário resgatar um ticket de saldo."""
+    partes = message.text.split()
+    if len(partes) < 2:
+        bot.send_message(message.chat.id, "⚠️ Uso correto: `/resgatar CODIGO` (ex: `/resgatar PROMO10`)", parse_mode="Markdown")
+        return
+        
+    codigo = partes[1].strip()
+    user = message.from_user
+    ok, msg, valor = db.resgatar_ticket(codigo, user.id)
+    
+    if ok:
+        registrar_evento(user.id, user.first_name or "Usuário", user.username or "", "resgatou ticket", f"{codigo.upper()} (R$ {valor:.2f})")
+        notificar_dono(
+            f"🎟️ *Ticket Resgatado!*\n\n"
+            f"👤 Nome: {user.first_name}\n"
+            f"📱 Username: @{user.username if user.username else 'sem @'}\n"
+            f"🆔 ID: `{user.id}`\n"
+            f"🎟️ Ticket: `{codigo.upper()}`\n"
+            f"💵 Valor: R$ {valor:.2f}"
+        )
+        
+    bot.send_message(message.chat.id, msg, parse_mode="Markdown")
+
+
 @bot.message_handler(func=lambda m: True)
 def handle_text(message):
     chat_id = message.chat.id
     estado  = user_state.get(chat_id)
 
+    if estado == "aguardando_dados_ticket":
+        partes = message.text.split()
+        if len(partes) < 2:
+            bot.send_message(chat_id, "⚠️ Formato inválido! Envie o código e o valor. Exemplo: `PROMO10 15`", parse_mode="Markdown")
+            return
+        codigo = partes[0].strip()
+        try:
+            valor = float(partes[1].replace(',', '.'))
+        except ValueError:
+            bot.send_message(chat_id, "⚠️ Valor inválido. Digite apenas números. Ex: `15` ou `29.90`", parse_mode="Markdown")
+            return
+            
+        ok, msg = db.criar_ticket(codigo, valor)
+        user_state.pop(chat_id, None)
+        bot.send_message(chat_id, msg, parse_mode="Markdown")
+        return
+
+    if estado == "aguardando_codigo_ticket":
+        codigo = message.text.strip()
+        user = message.from_user
+        ok, msg, valor = db.resgatar_ticket(codigo, user.id)
+        user_state.pop(chat_id, None)
+        
+        if ok:
+            registrar_evento(user.id, user.first_name or "Usuário", user.username or "", "resgatou ticket", f"{codigo.upper()} (R$ {valor:.2f})")
+            notificar_dono(
+                f"🎟️ *Ticket Resgatado!*\n\n"
+                f"👤 Nome: {user.first_name}\n"
+                f"📱 Username: @{user.username if user.username else 'sem @'}\n"
+                f"🆔 ID: `{user.id}`\n"
+                f"🎟️ Ticket: `{codigo.upper()}`\n"
+                f"💵 Valor: R$ {valor:.2f}"
+            )
+            
+        bot.send_message(chat_id, msg, parse_mode="Markdown")
+        return
+
+    if type(estado) is dict and estado.get("estado") == "aguardando_rem_cartao_indice":
+        cat = estado["categoria"]
+        texto = message.text.strip().upper()
+        
+        if texto == "TUDO":
+            db.limpar_categoria_estoque(cat)
+            user_state.pop(chat_id, None)
+            bot.send_message(chat_id, f"✅ Todo o estoque da categoria *{cat}* foi zerado!", parse_mode="Markdown")
+            return
+            
+        try:
+            idx = int(texto)
+        except ValueError:
+            bot.send_message(chat_id, "⚠️ Digite o NÚMERO do cartão que deseja remover (ex: `1`) ou `TUDO`.", parse_mode="Markdown")
+            return
+            
+        ok, removido = db.remover_cartao_por_indice(cat, idx)
+        user_state.pop(chat_id, None)
+        if ok:
+            bot.send_message(chat_id, f"✅ Cartão #{idx} removido da categoria *{cat}*:\n`{removido}`", parse_mode="Markdown")
+        else:
+            bot.send_message(chat_id, f"❌ Erro: {removido}", parse_mode="Markdown")
+        return
+
     if estado == "aguardando_cat_add":
+
         cat = message.text.strip().upper()
         user_state[chat_id] = {"estado": "aguardando_ccs_add", "categoria": cat}
         bot.send_message(
@@ -573,15 +721,86 @@ def callback_query(call):
     elif call.data == "adm_rem_cc":
         if call.from_user.id != DONO_ID:
             return
-        user_state[chat_id] = "aguardando_cat_rem"
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text="📦 *Estoque por Categoria*\nSelecione a categoria para visualizar os cartões e remover:",
+            parse_mode="Markdown",
+            reply_markup=menu_categorias_estoque()
+        )
+
+    elif call.data == "adm_voltar_menu":
+        if call.from_user.id != DONO_ID:
+            return
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=call.message.message_id,
+            text="🛠️ *Painel do Administrador*\n\nEscolha uma opção:",
+            parse_mode="Markdown",
+            reply_markup=menu_adm()
+        )
+
+    elif call.data == "adm_criar_ticket":
+        if call.from_user.id != DONO_ID:
+            return
+        user_state[chat_id] = "aguardando_dados_ticket"
         bot.answer_callback_query(call.id)
         bot.send_message(
             chat_id,
-            "➖ *Remover Cartões*\n\n"
-            "Digite a Categoria para limpar (remover todos dessa categoria). Exemplo: *AMEX*\n"
-            "Se quiser zerar o estoque todo, digite *TUDO*.",
+            "🎟️ *Criar Novo Ticket de Saldo*\n\n"
+            "Digite o código do ticket e o valor separados por espaço.\n"
+            "Exemplo: `PROMO10 15` ou `BEMVINDO 20.00`\n\n"
+            "_Dica: Você também pode usar o comando /criarticket CODIGO VALOR_",
             parse_mode="Markdown"
         )
+
+    elif call.data == "resgatar_ticket":
+        user_state[chat_id] = "aguardando_codigo_ticket"
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            "🎟️ *Resgatar Ticket de Saldo*\n\n"
+            "Digite o código do seu ticket para resgatar o saldo.\n"
+            "Exemplo: `PROMO10`\n\n"
+            "_Dica: Você também pode usar o comando /resgatar SEUCODIGO_",
+            parse_mode="Markdown"
+        )
+
+    elif call.data.startswith("adm_cat_rem_"):
+        if call.from_user.id != DONO_ID:
+            return
+        cat_clean = call.data.replace("adm_cat_rem_", "")
+        mapa_cats = {
+            "NUBAGOLD": "NUBA GOLD",
+            "NUBAPLATINUM": "NUBA PLATINUM",
+            "TRADREWARDS": "TRAD REWARDS"
+        }
+        cat = mapa_cats.get(cat_clean, cat_clean)
+        
+        cartoes = db.obter_cartoes_detalhados_categoria(cat)
+        bot.answer_callback_query(call.id)
+        
+        if not cartoes:
+            bot.send_message(chat_id, f"⚠️ A categoria *{cat}* está vazia no momento!", parse_mode="Markdown")
+            return
+            
+        linhas = [f"📦 *Estoque da categoria {cat}* (Total: {len(cartoes)}):\n"]
+        for idx, c in enumerate(cartoes, 1):
+            linhas.append(f"`{idx}.` `{c['conteudo']}`")
+            
+        linhas.append("\n📌 *Como remover:*")
+        linhas.append("• Digite o *número* do cartão que deseja remover (ex: `1` para o primeiro).")
+        linhas.append("• Digite *TUDO* para apagar todos os cartões desta categoria.")
+        
+        texto = "\n".join(linhas)
+        if len(texto) > 4000:
+            texto = texto[:4000] + "\n\n_...lista truncada_"
+            
+        user_state[chat_id] = {"estado": "aguardando_rem_cartao_indice", "categoria": cat}
+        bot.send_message(chat_id, texto, parse_mode="Markdown")
+
 
     elif call.data == "saldo":
         user_state[chat_id] = "aguardando_valor_saldo"

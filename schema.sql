@@ -32,3 +32,18 @@ CREATE TABLE IF NOT EXISTS public.historico (
 
 -- Index para buscas rápidas por user_id no histórico
 CREATE INDEX IF NOT EXISTS idx_historico_user_id ON public.historico(user_id);
+
+-- 4. Tabela de Tickets (Cupons de Saldo)
+CREATE TABLE IF NOT EXISTS public.tickets (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    codigo TEXT UNIQUE NOT NULL,
+    valor NUMERIC(10, 2) NOT NULL,
+    usado BOOLEAN DEFAULT FALSE,
+    usado_por BIGINT,
+    usado_em TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Index para buscas rápidas por código no ticket
+CREATE INDEX IF NOT EXISTS idx_tickets_codigo ON public.tickets(codigo);
+
