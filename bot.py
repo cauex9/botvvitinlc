@@ -816,41 +816,58 @@ def callback_query(call):
 
     elif call.data == "conta":
         bot.answer_callback_query(call.id)
-        msg_wait = bot.send_message(chat_id, "⏳ Consultando saldo, aguarde...")
-        dados = consultar_saldo()
-        try:
-            bot.delete_message(chat_id, msg_wait.message_id)
-        except Exception:
-            pass
+        user_id = call.from_user.id
+        nome = call.from_user.first_name or "Usuário"
+        uname = call.from_user.username or ""
+        saldo = saldo_usuario(user_id)
 
-        if dados.get("error"):
-            bot.send_message(
-                chat_id,
-                f"❌ Erro ao consultar saldo: `{dados['error']}`",
-                parse_mode="Markdown"
-            )
-        else:
-            disponivel = dados.get("available", 0)
-            pendente   = dados.get("pending", 0)
-            retido     = dados.get("fundLock", 0)
-            bot.send_message(
-                chat_id,
-                f"👤 *Minha Conta*\n\n"
-                f"ID: `{call.from_user.id}`\n"
-                f"Nome: {call.from_user.first_name}\n\n"
-                f"💰 *Saldo disponível:* R$ {disponivel:.2f}\n"
-                f"⏳ *Saldo pendente:* R$ {pendente:.2f}\n"
-                f"🔒 *Saldo retido:* R$ {retido:.2f}",
-                parse_mode="Markdown"
-            )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("💰 Adicionar saldo", callback_data="saldo"))
+        markup.add(InlineKeyboardButton("🎟️ Resgatar Ticket", callback_data="resgatar_ticket"))
+        markup.add(InlineKeyboardButton("⬅️ Voltar", callback_data="voltar"))
+
+        bot.send_message(
+            chat_id,
+            f"👤 *Minha Conta*\n\n"
+            f"🆔 *ID:* `{user_id}`\n"
+            f"👤 *Nome:* {nome}\n"
+            f"📱 *Username:* @{uname if uname else 'sem @'}\n\n"
+            f"💰 *Seu Saldo no Bot:* R$ {saldo:.2f}",
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+
 
     elif call.data.startswith("prod_"):
         partes     = call.data.replace("prod_", "").split("|")
         nome_prod  = partes[0] if len(partes) > 0 else "Produto"
-        preco_prod = partes[1] if len(partes) > 1 else "?"
+        preco_str  = partes[1] if len(partes) > 1 else "0"
         
-        estoque_val = db.obter_quantidade_estoque(nome_prod)
+        try:
+            preco = float(preco_str.replace(',', '.'))
+        except ValueError:
+            preco = 0.0
 
+        saldo = saldo_usuario(call.from_user.id)
+
+        # 1. Checa primeiro se o usuário tem saldo suficiente
+        if saldo < preco:
+            bot.answer_callback_query(call.id, "Saldo insuficiente!")
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("💰 Adicionar saldo", callback_data="saldo"))
+            markup.add(InlineKeyboardButton("⬅️ Voltar", callback_data="voltar"))
+            bot.send_message(
+                chat_id,
+                f"💳 *{nome_prod}* custa R$ {preco:.2f}.\n"
+                f"Seu saldo atual é *R$ {saldo:.2f}*.\n\n"
+                "⚠️ Você não tem saldo suficiente para esta compra. Adicione saldo abaixo:",
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+            return
+
+        # 2. Se o usuário tiver saldo suficiente, checa o estoque
+        estoque_val = db.obter_quantidade_estoque(nome_prod)
         if estoque_val <= 0:
             bot.answer_callback_query(call.id, "Produto sem estoque!")
             bot.send_message(
@@ -859,31 +876,46 @@ def callback_query(call):
                 "Por favor, volte mais tarde.",
                 parse_mode="Markdown"
             )
-        else:
-            saldo = saldo_usuario(call.from_user.id)
-            preco = float(preco_prod.replace(',', '.'))
-            if saldo < preco:
-                bot.answer_callback_query(call.id, "Saldo insuficiente")
-                markup = InlineKeyboardMarkup()
-                markup.add(InlineKeyboardButton("💰 Adicionar saldo", callback_data="saldo"))
-                markup.add(InlineKeyboardButton("⬅️ Voltar", callback_data="voltar"))
-                bot.send_message(
-                    chat_id,
-                    f"💳 *{nome_prod}* custa R$ {preco:.2f}.\n"
-                    f"Seu saldo atual é R$ {saldo:.2f}.\n\n"
-                    "Adicione saldo para continuar a compra:",
-                    parse_mode="Markdown",
-                    reply_markup=markup
-                )
-                return
+            return
 
-            bot.answer_callback_query(call.id)
+        # 3. Retira o cartão do estoque e realiza a cobrança do saldo
+        cartao = db.retirar_cartao_estoque(nome_prod)
+        if not cartao:
+            bot.answer_callback_query(call.id, "Produto sem estoque!")
             bot.send_message(
                 chat_id,
-                f"🛒 Você selecionou: *{nome_prod}* | R$ {preco_prod}\n\n"
-                "Adicione saldo via 💰 *Adicionar saldo* e então contate o suporte.",
+                f"⚠️ Ops! Não temos cartões *{nome_prod}* no estoque no momento.\n"
+                "Por favor, volte mais tarde.",
                 parse_mode="Markdown"
             )
+            return
+
+        # Desconta o saldo do usuário
+        db.descontar_saldo(call.from_user.id, preco)
+        novo_saldo = saldo_usuario(call.from_user.id)
+
+        bot.answer_callback_query(call.id, "Compra realizada com sucesso!")
+        bot.send_message(
+            chat_id,
+            f"✅ *Compra realizada com sucesso!*\n\n"
+            f"💳 *Produto:* {nome_prod}\n"
+            f"💰 *Valor pago:* R$ {preco:.2f}\n"
+            f"💼 *Saldo restante:* R$ {novo_saldo:.2f}\n\n"
+            f"📋 *Dados do Cartão:*\n`{cartao}`",
+            parse_mode="Markdown"
+        )
+
+        # Registra o evento e notifica o dono
+        registrar_evento(call.from_user.id, call.from_user.first_name or "Usuário", uname, "comprou CC", f"{nome_prod} (R$ {preco:.2f})")
+        notificar_dono(
+            f"🛍️ *Nova Compra Realizada!*\n\n"
+            f"👤 Nome: {call.from_user.first_name}\n"
+            f"📱 Username: @{uname if uname else 'sem @'}\n"
+            f"🆔 ID: `{call.from_user.id}`\n"
+            f"💳 Cartão: *{nome_prod}*\n"
+            f"💵 Valor: R$ {preco:.2f}"
+        )
+
 
 # ─────────────────────────────────────────────
 # INICIALIZAÇÃO E SERVIDOR WEB FALSO PARA A RENDER
