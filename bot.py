@@ -821,21 +821,51 @@ def callback_query(call):
         uname = call.from_user.username or ""
         saldo = saldo_usuario(user_id)
 
+        uname_clean = uname.replace('_', '\\_').replace('*', '\\*').replace('`', '\\`') if uname else "sem @"
+
         markup = InlineKeyboardMarkup()
         markup.add(InlineKeyboardButton("💰 Adicionar saldo", callback_data="saldo"))
         markup.add(InlineKeyboardButton("🎟️ Resgatar Ticket", callback_data="resgatar_ticket"))
         markup.add(InlineKeyboardButton("⬅️ Voltar", callback_data="voltar"))
 
-        bot.send_message(
-            chat_id,
+        texto = (
             f"👤 *Minha Conta*\n\n"
             f"🆔 *ID:* `{user_id}`\n"
             f"👤 *Nome:* {nome}\n"
-            f"📱 *Username:* @{uname if uname else 'sem @'}\n\n"
-            f"💰 *Seu Saldo no Bot:* R$ {saldo:.2f}",
-            parse_mode="Markdown",
-            reply_markup=markup
+            f"📱 *Username:* @{uname_clean}\n\n"
+            f"💰 *Seu Saldo no Bot:* R$ {saldo:.2f}"
         )
+
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=call.message.message_id,
+                text=texto,
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+        except Exception:
+            try:
+                bot.send_message(
+                    chat_id,
+                    texto,
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+            except Exception:
+                texto_puro = (
+                    f"👤 Minha Conta\n\n"
+                    f"🆔 ID: {user_id}\n"
+                    f"👤 Nome: {nome}\n"
+                    f"📱 Username: @{uname if uname else 'sem @'}\n\n"
+                    f"💰 Seu Saldo no Bot: R$ {saldo:.2f}"
+                )
+                bot.send_message(
+                    chat_id,
+                    texto_puro,
+                    reply_markup=markup
+                )
+
 
 
     elif call.data.startswith("prod_"):
